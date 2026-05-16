@@ -251,30 +251,34 @@ const INTER_MORSE=4.0,PRE_MORSE=1.0;
 let masterBus=null,dotBuffer=null,dashBuffer=null,fullBuffer=null,chunks=[];
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-function triWave(p){const t=(p%(2*Math.PI))/(2*Math.PI);return t<0.25?4*t:t<0.75?2-4*t:-4+4*t;}
+function triWave(p){var t=(p%(2*Math.PI))/(2*Math.PI);return t<0.25?4*t:t<0.75?2-4*t:-4+4*t;}
 
 function generateChirpBuffer(ctx,duration){
-  const sr=ctx.sampleRate,len=Math.floor(sr*duration),buf=ctx.createBuffer(1,len,sr),d=buf.getChannelData(0),TAU=2*Math.PI;
-  let ph1=0,ph2=0;
-  for(let i=0;i<len;i++){
-    const p=i/len,f1=9000*Math.pow(1800/9000,p),f2=12000*Math.pow(2800/12000,p);
+  // Frequencies kept in 600-3500Hz range — iPhone 5s speaker rolls off above ~6kHz
+  var sr=ctx.sampleRate,len=Math.floor(sr*duration),buf=ctx.createBuffer(1,len,sr),d=buf.getChannelData(0),TAU=2*Math.PI;
+  var ph1=0,ph2=0;
+  for(var i=0;i<len;i++){
+    var p=i/len;
+    var f1=3000*Math.pow(600/3000,p);   // 3kHz → 600Hz sweep
+    var f2=5000*Math.pow(1000/5000,p);  // 5kHz → 1kHz harmonic
     ph1=(ph1+TAU*f1/sr)%TAU; ph2=(ph2+TAU*f2/sr)%TAU;
-    const atk=Math.floor(0.008*sr);
-    let env=i<atk?i/atk:Math.exp(-((i-atk)/(len-atk))*5);
-    const fade=Math.floor(0.005*sr);
+    var atk=Math.floor(0.008*sr);
+    var env=i<atk?i/atk:Math.exp(-((i-atk)/(len-atk))*5);
+    var fade=Math.floor(0.005*sr);
     if(i<fade)env*=i/fade; if(i>len-fade)env*=(len-i)/fade;
-    d[i]=env*(0.65*Math.sin(ph1)+0.28*triWave(ph2));
+    d[i]=env*(0.70*Math.sin(ph1)+0.25*triWave(ph2));
   }
-  let peak=0; for(let i=0;i<len;i++)peak=Math.max(peak,Math.abs(d[i]));
-  if(peak>0)for(let i=0;i<len;i++)d[i]=d[i]/peak*0.85;
+  var peak=0; for(var j=0;j<len;j++)peak=Math.max(peak,Math.abs(d[j]));
+  if(peak>0)for(var k=0;k<len;k++)d[k]=d[k]/peak*0.95;
   return buf;
 }
 
 function chirp(ctx,t,duration){
-  const buf=duration<(DOT+DASH)/2?dotBuffer:dashBuffer; if(!buf)return;
-  const src=ctx.createBufferSource(); src.buffer=buf;
-  src.detune.value=(Math.random()-0.5)*60;
-  src.connect(masterBus||ctx.destination); src.start(t);
+  var buf=duration<(DOT+DASH)/2?dotBuffer:dashBuffer; if(!buf)return;
+  var src=ctx.createBufferSource(); src.buffer=buf;
+  src.detune.value=(Math.random()-0.5)*40;
+  src.connect(ctx.destination); // direct — no compressor, simpler path on old iOS
+  src.start(t);
 }
 
 async function loadAndSliceAudio(ctx){
