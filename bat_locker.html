@@ -231,6 +231,164 @@
 <div id="root"></div>
 <script src="https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js"></script>
 <script>
+var WORDS   = ["SEVEN","TWO","EIGHT","NINE"];
+var params  = new URLSearchParams(window.location.search);
+var TOPIC   = params.get("topic") || "olibatlocker";
+var MQTT_BROKER = "wss://broker.hivemq.com:8884/mqtt";
+var TRIGGER = params.get("mode") === "trigger";
+var SPLIT_TIMES = [0,19.98,39.75,60.07,80.43,99.30,118.28];
+var AUDIO_URL = "./bats.mp3";
+var MORSE_URL = "./morse.mp3";
+
+var fullBuffer=null,chunks=[],morseBuffer=null,ctx=null;
+var cycleOn=false,armed=false;
+
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
+
+async function resumeCtx(){
+  if(ctx&&ctx.state==="suspended") await ctx.resume();
+}
+
+function playBuffer(buffer){
+  return new Promise(function(resolve){
+    var done=false;
+    function finish(){if(!done){done=true;resolve();}}
+    resumeCtx().then(function(){
+      var src=ctx.createBufferSource();
+      src.buffer=buffer;
+      src.connect(ctx.destination);
+      src.start();
+      src.onended=finish;
+      setTimeout(finish,buffer.duration*1000+800);
+    });
+  });
+}
+
+async function loadAudio(){
+  var r1=await fetch(AUDIO_URL);
+  var ab1=await r1.arrayBuffer();
+  fullBuffer=await new Promise(function(res,rej){ctx.decodeAudioData(ab1,res,rej);});
+  var sr=fullBuffer.sampleRate; chunks=[];
+  for(var i=0;i<SPLIT_TIMES.length-1;i++){
+    var s=Math.floor(SPLIT_TIMES[i]*sr),e=Math.floor(SPLIT_TIMES[i+1]*sr);
+    var chunk=ctx.createBuffer(fullBuffer.numberOfChannels,e-s,sr);
+    for(var ch=0;ch<fullBuffer.numberOfChannels;ch++)
+      chunk.getChannelData(ch).set(fullBuffer.getChannelData(ch).subarray(s,e));
+    chunks.push(chunk);
+  }
+  var r2=await fetch(MORSE_URL);
+  var ab2=await r2.arrayBuffer();
+  morseBuffer=await new Promise(function(res,rej){ctx.decodeAudioData(ab2,res,rej);});
+}
+
+function setLabel(txt,active){
+  var el=document.getElementById("lbl");
+  el.textContent=txt;
+  el.classList.toggle("active",!!active);
+}
+function setPhase(id){
+  ["chunk","morse"].forEach(function(p){
+    var el=document.getElementById("phase-"+p);
+    if(el)el.classList.remove("done");
+  });
+  if(id){var ea=document.getElementById("phase-"+id);if(ea)ea.classList.add("done");}
+}
+function activateSonar(){
+  ["r1","r2","r3"].forEach(function(id){
+    document.getElementById(id).classList.add("active");
+  });
+}
+
+async function startCycle(){
+  cycleOn=true;
+  var chunkIdx=0;
+  setPhase("chunk"); setLabel("ambient");
+  await playBuffer(chunks[0]);
+  setPhase("morse"); setLabel("transmitting",true);
+  await playBuffer(morseBuffer);
+  await sleep(2000);
+  chunkIdx=1;
+  while(cycleOn){
+    try{
+      setPhase("chunk"); setLabel("ambient");
+      await playBuffer(chunks[chunkIdx%chunks.length]);
+      setPhase("morse"); setLabel("transmitting",true);
+      await playBuffer(morseBuffer);
+      await sleep(2000);
+      chunkIdx++;
+    }catch(e){console.error("cycle err",e);}
+  }
+}
+
+function initListen(){
+  var root=document.getElementById("root");
+  root.innerHTML=
+    '<div class="sonar-wrap" id="sonar">' +
+      '<div class="ring" id="r1"></div><div class="ring" id="r2"></div><div class="ring" id="r3"></div>' +
+      '<span class="bat-glyph" id="bat">&#x1F987;</span>' +
+    '</div>' +
+    '<div class="label" id="lbl">tap to arm</div>' +
+    '<div class="rep-dots" id="rep-dots"></div>' +
+    '<button class="btn" id="arm-btn">arm</button>' +
+    '<button class="btn ghost" id="test-btn" style="display:none">test</button>';
+
+  var repDots=document.getElementById("rep-dots");
+  ["chunk","morse"].forEach(function(id){
+    var d=document.createElement("div");
+    d.className="rep-dot"; d.id="phase-"+id;
+    repDots.appendChild(d);
+  });
+
+  function arm(){
+    if(armed)return; armed=true;
+    ctx=new(window.AudioContext||window.webkitAudioContext)();
+    document.getElementById("arm-btn").style.display="none";
+    setLabel("loading audio...");
+    activateSonar();
+    loadAudio().then(function(){
+      setLabel("armed -- waiting for signal");
+      document.getElementById("test-btn").style.display="block";
+      var client=mqtt.connect(MQTT_BROKER,{clientId:"bat_"+Math.random().toString(16).substr(2,8),clean:true});
+      client.on("connect",function(){client.subscribe(TOPIC);});
+      client.on("message",function(){if(!cycleOn)startCycle();});
+      client.on("error",function(){setLabel("connection error -- reload");});
+      client.on("offline",function(){setLabel("connection lost -- reload");});
+    }).catch(function(e){setLabel("load failed");console.error(e);});
+  }
+
+  document.getElementById("arm-btn").addEventListener("click",arm);
+  document.getElementById("test-btn").addEventListener("click",function(){
+    if(!cycleOn&&ctx){
+      setPhase("chunk"); setLabel("ambient");
+      playBuffer(chunks[0]).then(function(){
+        setPhase("morse"); setLabel("transmitting",true);
+        return playBuffer(morseBuffer);
+      }).then(function(){setPhase(null);setLabel("armed -- waiting for signal");});
+    }
+  });
+}
+
+function initTrigger(){
+  var root=document.getElementById("root");
+  root.innerHTML='<span class="trigger-icon">&#x1F987;</span><div class="trigger-status" id="tstatus">sending signal...</div>';
+  var client=mqtt.connect(MQTT_BROKER,{clientId:"trig_"+Math.random().toString(16).substr(2,8),clean:true});
+  client.on("connect",function(){
+    client.publish(TOPIC,"play",{qos:1},function(err){
+      var s=document.getElementById("tstatus");
+      if(err){s.className="trigger-status error";s.textContent="failed -- check connection";}
+      else{s.className="trigger-status sent fade-up";s.innerHTML="signal sent<br><br>listen carefully...";}
+      client.end();
+    });
+  });
+  client.on("error",function(){
+    var s=document.getElementById("tstatus");
+    s.className="trigger-status error";s.textContent="failed -- check connection";
+  });
+}
+
+TRIGGER?initTrigger():initListen();
+</script>
+<script>
 const WORDS   = ["SEVEN", "TWO", "EIGHT", "NINE"];
 const params  = new URLSearchParams(window.location.search);
 const TOPIC   = params.get("topic") || "olibatlocker";
