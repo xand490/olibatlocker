@@ -291,31 +291,39 @@ async function loadAndSliceAudio(ctx){
   }
 }
 
-function playBuffer(ctx,buffer){
-  return new Promise(resolve=>{
-    let done=false; const finish=()=>{if(!done){done=true;resolve();}};
-    const src=ctx.createBufferSource(); src.buffer=buffer;
+// Resume AudioContext before every playback — iOS suspends it aggressively
+async function resumeCtx(ctx){
+  if(ctx.state==="suspended") await ctx.resume();
+}
+
+async function playBuffer(ctx,buffer){
+  await resumeCtx(ctx);
+  return new Promise(function(resolve){
+    var done=false;
+    function finish(){if(!done){done=true;resolve();}}
+    var src=ctx.createBufferSource(); src.buffer=buffer;
     src.connect(ctx.destination); src.start();
     src.onended=finish; setTimeout(finish,buffer.duration*1000+600);
   });
 }
 
-function scheduleWords(ctx){
-  let t=ctx.currentTime+PRE_MORSE; const events=[];
-  WORDS.forEach((word,wi)=>{
-    word.split("").forEach((letter,li)=>{
-      const pattern=MORSE[letter]; if(!pattern)return;
-      pattern.split("").forEach((sym,si)=>{
-        const dur=sym==="."?DOT:DASH;
+async function scheduleWords(ctx){
+  await resumeCtx(ctx);
+  var t=ctx.currentTime+PRE_MORSE; var events=[];
+  WORDS.forEach(function(word,wi){
+    word.split("").forEach(function(letter,li){
+      var pattern=MORSE[letter]; if(!pattern)return;
+      pattern.split("").forEach(function(sym,si){
+        var dur=sym==="."?DOT:DASH;
         chirp(ctx,t,dur);
-        events.push({tOffset:t-ctx.currentTime,dur,wi,li,si});
+        events.push({tOffset:t-ctx.currentTime,dur:dur,wi:wi,li:li,si:si});
         t+=dur; if(si<pattern.length-1)t+=SYM_GAP;
       });
       if(li<word.length-1)t+=CHAR_GAP;
     });
     if(wi<WORDS.length-1)t+=WORD_GAP;
   });
-  return{events,totalMs:(t-ctx.currentTime)*1000+500};
+  return{events:events,totalMs:(t-ctx.currentTime)*1000+500};
 }
 
 function initListen(){
@@ -364,38 +372,43 @@ function initListen(){
   }
   function activateSonar(){["r1","r2","r3"].forEach(id=>document.getElementById(id).classList.add("active"));}
   function playMorseOnce(){
-    return new Promise(resolve=>{
-      document.getElementById("bat").classList.add("transmitting");
-      const{events,totalMs}=scheduleWords(ctx);
-      events.forEach(ev=>{
-        setTimeout(()=>{
-          const pip=document.getElementById(`pip-${ev.wi}-${ev.li}-${ev.si}`);
-          if(pip){pip.classList.add("lit");setTimeout(()=>pip.classList.remove("lit"),ev.dur*1000-10);}
-        },ev.tOffset*1000);
+    return scheduleWords(ctx).then(function(result){
+      return new Promise(function(resolve){
+        document.getElementById("bat").classList.add("transmitting");
+        result.events.forEach(function(ev){
+          setTimeout(function(){
+            var pip=document.getElementById("pip-"+ev.wi+"-"+ev.li+"-"+ev.si);
+            if(pip){pip.classList.add("lit");setTimeout(function(){pip.classList.remove("lit");},ev.dur*1000-10);}
+          },ev.tOffset*1000);
+        });
+        setTimeout(function(){document.getElementById("bat").classList.remove("transmitting");resolve();},result.totalMs);
       });
-      setTimeout(()=>{document.getElementById("bat").classList.remove("transmitting");resolve();},totalMs);
     });
   }
   async function startCycle(){
-    cycleOn=true; let chunkIdx=0;
-    // First run: full audio then Morse x2
-    setPhase("full"); setLabel("ambient");
-    await playBuffer(ctx,fullBuffer);
+    cycleOn=true;
+    var chunkIdx=0;
+    // First run: one 20s chunk then Morse x2
+    setPhase("chunk"); setLabel("ambient");
+    await playBuffer(ctx,chunks[0]);
     setPhase("morse"); setLabel("transmitting 1/2",true);
     await playMorseOnce();
     await sleep(INTER_MORSE*1000);
     setLabel("transmitting 2/2",true);
     await playMorseOnce();
     await sleep(2000);
+    chunkIdx=1; // start subsequent loop from chunk 2
     // Subsequent: chunk -> morse -> chunk -> morse ...
     while(cycleOn){
-      const chunk=chunks[chunkIdx%chunks.length];
-      setPhase("chunk"); setLabel(`chunk ${(chunkIdx%chunks.length)+1}/${chunks.length}`);
-      await playBuffer(ctx,chunk);
-      setPhase("morse"); setLabel("transmitting",true);
-      await playMorseOnce();
-      await sleep(2000);
-      chunkIdx++;
+      try{
+        var chunk=chunks[chunkIdx%chunks.length];
+        setPhase("chunk"); setLabel("ambient");
+        await playBuffer(ctx,chunk);
+        setPhase("morse"); setLabel("transmitting",true);
+        await playMorseOnce();
+        await sleep(2000);
+        chunkIdx++;
+      }catch(e){console.error(e);}
     }
   }
   function arm(){
