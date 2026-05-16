@@ -231,109 +231,101 @@
 <div id="root"></div>
 <script src="https://unpkg.com/mqtt@4.3.7/dist/mqtt.min.js"></script>
 <script>
-var WORDS   = ["SEVEN","TWO","EIGHT","NINE"];
-var params  = new URLSearchParams(window.location.search);
-var TOPIC   = params.get("topic") || "olibatlocker";
+var TOPIC       = (new URLSearchParams(window.location.search)).get("topic") || "olibatlocker";
 var MQTT_BROKER = "wss://broker.hivemq.com:8884/mqtt";
-var TRIGGER = params.get("mode") === "trigger";
-var SPLIT_TIMES = [0,19.98,39.75,60.07,80.43,99.30,118.28];
-var AUDIO_URL = "./bats.mp3";
-var MORSE_URL = "./morse.mp3";
+var TRIGGER     = (new URLSearchParams(window.location.search)).get("mode") === "trigger";
+var SPLITS      = [0, 19.98, 39.75, 60.07, 80.43, 99.30, 118.28];
 
-var fullBuffer=null,chunks=[],morseBuffer=null,ctx=null;
-var cycleOn=false,armed=false;
+var batsAudio  = null;
+var morseAudio = null;
+var cycleOn    = false;
+var armed      = false;
 
-function sleep(ms){return new Promise(function(r){setTimeout(r,ms);});}
+function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
 
-async function resumeCtx(){
-  if(ctx&&ctx.state==="suspended") await ctx.resume();
-}
-
-function playBuffer(buffer){
-  return new Promise(function(resolve){
-    var done=false;
-    function finish(){if(!done){done=true;resolve();}}
-    resumeCtx().then(function(){
-      var src=ctx.createBufferSource();
-      src.buffer=buffer;
-      src.connect(ctx.destination);
-      src.start();
-      src.onended=finish;
-      setTimeout(finish,buffer.duration*1000+800);
-    });
-  });
-}
-
-async function loadAudio(){
-  // Load bat audio (required)
-  setLabel("loading bats...");
-  var r1=await fetch(AUDIO_URL);
-  var ab1=await r1.arrayBuffer();
-  fullBuffer=await new Promise(function(res,rej){ctx.decodeAudioData(ab1,res,rej);});
-  var sr=fullBuffer.sampleRate; chunks=[];
-  for(var i=0;i<SPLIT_TIMES.length-1;i++){
-    var s=Math.floor(SPLIT_TIMES[i]*sr),e=Math.floor(SPLIT_TIMES[i+1]*sr);
-    var chunk=ctx.createBuffer(fullBuffer.numberOfChannels,e-s,sr);
-    for(var ch=0;ch<fullBuffer.numberOfChannels;ch++)
-      chunk.getChannelData(ch).set(fullBuffer.getChannelData(ch).subarray(s,e));
-    chunks.push(chunk);
-  }
-  // Load morse audio (optional — falls back to silence if missing)
-  setLabel("loading morse...");
-  try{
-    var r2=await fetch(MORSE_URL);
-    var ab2=await r2.arrayBuffer();
-    morseBuffer=await new Promise(function(res,rej){ctx.decodeAudioData(ab2,res,rej);});
-  }catch(e){
-    console.warn("morse.mp3 not loaded:",e);
-    morseBuffer=ctx.createBuffer(1,ctx.sampleRate*2,ctx.sampleRate); // 2s silence fallback
-  }
-}
-
-function setLabel(txt,active){
-  var el=document.getElementById("lbl");
-  el.textContent=txt;
-  el.classList.toggle("active",!!active);
+function setLabel(txt, active){
+  var el = document.getElementById("lbl");
+  if(!el) return;
+  el.textContent = txt;
+  el.classList.toggle("active", !!active);
 }
 function setPhase(id){
   ["chunk","morse"].forEach(function(p){
-    var el=document.getElementById("phase-"+p);
-    if(el)el.classList.remove("done");
+    var el = document.getElementById("phase-"+p);
+    if(el) el.classList.remove("done");
   });
-  if(id){var ea=document.getElementById("phase-"+id);if(ea)ea.classList.add("done");}
+  if(id){ var ea = document.getElementById("phase-"+id); if(ea) ea.classList.add("done"); }
 }
 function activateSonar(){
   ["r1","r2","r3"].forEach(function(id){
-    document.getElementById(id).classList.add("active");
+    var el = document.getElementById(id);
+    if(el) el.classList.add("active");
+  });
+}
+
+// Play a section of the bat audio file using currentTime
+function playChunk(idx){
+  return new Promise(function(resolve){
+    var si    = idx % (SPLITS.length - 1);
+    var start = SPLITS[si];
+    var end   = SPLITS[si + 1];
+    var dur   = (end - start) * 1000 + 400;
+
+    var timer = setTimeout(function(){ batsAudio.pause(); resolve(); }, dur);
+
+    batsAudio.currentTime = start;
+    var p = batsAudio.play();
+    if(p) p.catch(function(){ clearTimeout(timer); resolve(); });
+  });
+}
+
+// Play the morse MP3 from the start
+function playMorse(){
+  return new Promise(function(resolve){
+    morseAudio.currentTime = 0;
+    var dur = (morseAudio.duration && isFinite(morseAudio.duration))
+                ? morseAudio.duration * 1000 + 500
+                : 38000;
+    var timer = setTimeout(resolve, dur);
+    morseAudio.onended = function(){ clearTimeout(timer); resolve(); };
+    var p = morseAudio.play();
+    if(p) p.catch(function(){ clearTimeout(timer); resolve(); });
   });
 }
 
 async function startCycle(){
-  cycleOn=true;
-  var chunkIdx=0;
-  setPhase("chunk"); setLabel("ambient");
-  await playBuffer(chunks[0]);
-  setPhase("morse"); setLabel("transmitting",true);
-  await playBuffer(morseBuffer);
-  await sleep(2000);
-  chunkIdx=1;
+  cycleOn = true;
+  var chunkIdx = 0;
   while(cycleOn){
     try{
       setPhase("chunk"); setLabel("ambient");
-      await playBuffer(chunks[chunkIdx%chunks.length]);
-      setPhase("morse"); setLabel("transmitting",true);
-      await playBuffer(morseBuffer);
+      await playChunk(chunkIdx);
+      setPhase("morse"); setLabel("transmitting", true);
+      await playMorse();
       await sleep(2000);
       chunkIdx++;
-    }catch(e){console.error("cycle err",e);}
+    }catch(e){ console.error("cycle err", e); await sleep(1000); }
   }
 }
 
+function connectMQTT(){
+  var client = mqtt.connect(MQTT_BROKER, {
+    clientId: "bat_" + Math.random().toString(16).substr(2,8),
+    clean: true
+  });
+  client.on("connect",  function(){ client.subscribe(TOPIC); });
+  client.on("message",  function(){ if(!cycleOn) startCycle(); });
+  client.on("error",    function(){ setLabel("connection error -- reload"); });
+  client.on("offline",  function(){ setLabel("connection lost -- reload"); });
+}
+
 function initListen(){
-  var root=document.getElementById("root");
-  root.innerHTML=
+  var root = document.getElementById("root");
+  root.innerHTML =
     '<div class="sonar-wrap" id="sonar">' +
-      '<div class="ring" id="r1"></div><div class="ring" id="r2"></div><div class="ring" id="r3"></div>' +
+      '<div class="ring" id="r1"></div>' +
+      '<div class="ring" id="r2"></div>' +
+      '<div class="ring" id="r3"></div>' +
       '<span class="bat-glyph" id="bat">&#x1F987;</span>' +
     '</div>' +
     '<div class="label" id="lbl">tap to arm</div>' +
@@ -341,61 +333,79 @@ function initListen(){
     '<button class="btn" id="arm-btn">arm</button>' +
     '<button class="btn ghost" id="test-btn" style="display:none">test</button>';
 
-  var repDots=document.getElementById("rep-dots");
   ["chunk","morse"].forEach(function(id){
-    var d=document.createElement("div");
-    d.className="rep-dot"; d.id="phase-"+id;
-    repDots.appendChild(d);
+    var d = document.createElement("div");
+    d.className = "rep-dot"; d.id = "phase-"+id;
+    document.getElementById("rep-dots").appendChild(d);
   });
 
   function arm(){
-    if(armed)return; armed=true;
-    ctx=new(window.AudioContext||window.webkitAudioContext)();
-    document.getElementById("arm-btn").style.display="none";
-    setLabel("loading audio...");
+    if(armed) return; armed = true;
+    document.getElementById("arm-btn").style.display = "none";
+    setLabel("loading...");
     activateSonar();
-    loadAudio().then(function(){
+
+    // Create audio elements inside user gesture — required for iOS unlock
+    batsAudio  = new Audio("./bats.mp3");
+    morseAudio = new Audio("./morse.mp3");
+    batsAudio.preload  = "auto";
+    morseAudio.preload = "auto";
+
+    // Prime playback on iOS — must start inside gesture handler
+    var pb = batsAudio.play();
+    if(pb) pb.then(function(){ batsAudio.pause(); batsAudio.currentTime = 0; }).catch(function(){});
+    var pm = morseAudio.play();
+    if(pm) pm.then(function(){ morseAudio.pause(); morseAudio.currentTime = 0; }).catch(function(){});
+
+    // Show test button and connect after a short load delay
+    setTimeout(function(){
       setLabel("armed -- waiting for signal");
-      document.getElementById("test-btn").style.display="block";
-      var client=mqtt.connect(MQTT_BROKER,{clientId:"bat_"+Math.random().toString(16).substr(2,8),clean:true});
-      client.on("connect",function(){client.subscribe(TOPIC);});
-      client.on("message",function(){if(!cycleOn)startCycle();});
-      client.on("error",function(){setLabel("connection error -- reload");});
-      client.on("offline",function(){setLabel("connection lost -- reload");});
-    }).catch(function(e){setLabel("load failed");console.error(e);});
+      document.getElementById("test-btn").style.display = "block";
+      connectMQTT();
+    }, 3000);
   }
 
-  document.getElementById("arm-btn").addEventListener("click",arm);
-  document.getElementById("test-btn").addEventListener("click",function(){
-    if(!cycleOn&&ctx){
+  document.getElementById("arm-btn").addEventListener("click", arm);
+  document.getElementById("test-btn").addEventListener("click", function(){
+    if(!cycleOn){
       setPhase("chunk"); setLabel("ambient");
-      playBuffer(chunks[0]).then(function(){
-        setPhase("morse"); setLabel("transmitting",true);
-        return playBuffer(morseBuffer);
-      }).then(function(){setPhase(null);setLabel("armed -- waiting for signal");});
+      playChunk(0).then(function(){
+        setPhase("morse"); setLabel("transmitting", true);
+        return playMorse();
+      }).then(function(){ setPhase(null); setLabel("armed -- waiting for signal"); });
     }
   });
 }
 
 function initTrigger(){
-  var root=document.getElementById("root");
-  root.innerHTML='<span class="trigger-icon">&#x1F987;</span><div class="trigger-status" id="tstatus">sending signal...</div>';
-  var client=mqtt.connect(MQTT_BROKER,{clientId:"trig_"+Math.random().toString(16).substr(2,8),clean:true});
-  client.on("connect",function(){
-    client.publish(TOPIC,"play",{qos:1},function(err){
-      var s=document.getElementById("tstatus");
-      if(err){s.className="trigger-status error";s.textContent="failed -- check connection";}
-      else{s.className="trigger-status sent fade-up";s.innerHTML="signal sent<br><br>listen carefully...";}
+  var root = document.getElementById("root");
+  root.innerHTML = '<span class="trigger-icon">&#x1F987;</span>' +
+    '<div class="trigger-status" id="tstatus">sending signal...</div>';
+  var client = mqtt.connect(MQTT_BROKER, {
+    clientId: "trig_" + Math.random().toString(16).substr(2,8),
+    clean: true
+  });
+  client.on("connect", function(){
+    client.publish(TOPIC, "play", {qos:1}, function(err){
+      var s = document.getElementById("tstatus");
+      if(err){
+        s.className = "trigger-status error";
+        s.textContent = "failed -- check connection";
+      } else {
+        s.className = "trigger-status sent fade-up";
+        s.innerHTML = "signal sent<br><br>listen carefully...";
+      }
       client.end();
     });
   });
-  client.on("error",function(){
-    var s=document.getElementById("tstatus");
-    s.className="trigger-status error";s.textContent="failed -- check connection";
+  client.on("error", function(){
+    var s = document.getElementById("tstatus");
+    s.className = "trigger-status error";
+    s.textContent = "failed -- check connection";
   });
 }
 
-TRIGGER?initTrigger():initListen();
+TRIGGER ? initTrigger() : initListen();
 </script>
 
 </body>
